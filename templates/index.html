@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FocusAI Dashboard</title>
+    <link
+      rel="stylesheet"
+      href="{{ url_for('static', filename='style.css') }}"
+    />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand-block">
+          <div class="brand-mark">FA</div>
+          <div>
+            <p class="eyebrow">AI Productivity</p>
+            <h1>FocusAI</h1>
+          </div>
+        </div>
+
+        <div class="sidebar-card">
+          <p class="sidebar-label">Live Insight</p>
+          <h2 id="hero-state">Deep Focus</h2>
+          <p id="hero-message" class="sidebar-text">
+            Excellent focus. Keep going.
+          </p>
+        </div>
+
+        <div class="sidebar-card">
+          <p class="sidebar-label">Quick Tips</p>
+          <ul class="tip-list">
+            <li>Keep the study tab active.</li>
+            <li>Stay visible to the camera.</li>
+            <li>Take short breaks when fatigue appears.</li>
+          </ul>
+        </div>
+      </aside>
+
+      <main class="dashboard">
+        <header class="dashboard-header">
+          <div>
+            <p class="eyebrow">Smart Attention Dashboard</p>
+            <h2>Real-time focus and distraction intelligence</h2>
+          </div>
+
+          <div class="header-actions">
+            <label class="sound-toggle">
+              <input id="sound-enabled" type="checkbox" />
+              <span>Sound alert</span>
+            </label>
+            <div id="status-indicator" class="status-indicator deep">
+              <span class="status-dot"></span>
+              <span id="status-indicator-text">Deep Focus</span>
+            </div>
+          </div>
+        </header>
+
+        <section class="top-grid">
+          <article class="card metric-card">
+            <p class="card-label">Focus Score</p>
+            <div class="metric-value-wrap">
+              <strong id="focus-score" class="metric-value">96</strong>
+              <span class="metric-unit">/100</span>
+            </div>
+            <p class="card-footnote">Live score updated every 2 seconds</p>
+          </article>
+
+          <article class="card state-card">
+            <p class="card-label">Current State</p>
+            <h3 id="focus-state" class="state-title">Deep Focus</h3>
+            <p id="focus-message" class="card-footnote">
+              Excellent focus. Keep going.
+            </p>
+          </article>
+
+          <article class="card camera-card">
+            <div class="card-head">
+              <p class="card-label">Camera Preview</p>
+              <span id="camera-badge" class="camera-badge">Waiting...</span>
+            </div>
+            <div class="camera-frame">
+              <img
+                id="camera-preview"
+                src="{{ url_for('video_feed') }}"
+                alt="Live camera feed"
+              />
+              <div id="camera-overlay" class="camera-overlay">
+                Connecting to backend camera stream...
+              </div>
+            </div>
+          </article>
+        </section>
+
+        <section class="middle-grid">
+          <article class="card chart-card">
+            <div class="card-head">
+              <div>
+                <p class="card-label">Focus Trend</p>
+                <h3>Focus Score Over Time</h3>
+              </div>
+            </div>
+            <div class="chart-wrap">
+              <canvas id="focus-chart"></canvas>
+            </div>
+          </article>
+        </section>
+
+        <section class="bottom-grid">
+          <article class="card usage-card">
+            <div class="card-head">
+              <div>
+                <p class="card-label">Website Usage</p>
+                <h3>Active Sites</h3>
+              </div>
+            </div>
+            <div id="usage-list" class="usage-list">
+              <div class="empty-state">No website usage data yet.</div>
+            </div>
+          </article>
+
+          <article class="card summary-card">
+            <div class="card-head">
+              <div>
+                <p class="card-label">Session Summary</p>
+                <h3>Session Insights</h3>
+              </div>
+            </div>
+
+            <div class="summary-grid">
+              <div class="summary-item">
+                <span>Focus %</span>
+                <strong id="summary-focus">0%</strong>
+              </div>
+              <div class="summary-item">
+                <span>Distractions</span>
+                <strong id="summary-distractions">0</strong>
+              </div>
+              <div class="summary-item">
+                <span>Deep Focus Time</span>
+                <strong id="summary-deep-time">00:00:00</strong>
+              </div>
+              <div class="summary-item">
+                <span>Main Issue</span>
+                <strong id="summary-issue">none</strong>
+              </div>
+              <div class="summary-item full">
+                <span>Total Session Time</span>
+                <strong id="summary-total-time">00:00:00</strong>
+              </div>
+            </div>
+          </article>
+        </section>
+      </main>
+    </div>
+
+    <div id="warning-popup" class="warning-popup" aria-live="polite">
+      <strong>Focus Warning</strong>
+      <p id="warning-text">High distraction detected. Please return to your work.</p>
+    </div>
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+  </body>
+</html>

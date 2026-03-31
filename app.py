@@ -4,7 +4,6 @@ from flask import Flask, Response, jsonify, render_template, request
 
 from camera import FocusMonitor
 from usage_tracker import WebsiteUsageTracker
-from windows_control import minimize_active_browser_window
 
 
 app = Flask(__name__)
@@ -48,13 +47,25 @@ def video_feed():
 @app.route("/api/status")
 def get_status():
     """Return the latest focus data for the dashboard."""
-    return jsonify(get_monitor().get_status())
+    site_info = get_usage_tracker().get_current_site_info()
+    return jsonify(
+        get_monitor().get_status_with_site(
+            site_name=site_info["site"],
+            site_category=site_info["category"],
+        )
+    )
 
 
 @app.route("/status")
 def face_status():
     """Return whether a face is currently detected."""
-    return jsonify(get_monitor().get_face_detected_status())
+    site_info = get_usage_tracker().get_current_site_info()
+    return jsonify(
+        get_monitor().get_face_detected_status_with_site(
+            site_name=site_info["site"],
+            site_category=site_info["category"],
+        )
+    )
 
 
 @app.route("/api/tab-activity", methods=["POST"])
@@ -67,17 +78,12 @@ def update_tab_activity():
     monitor.update_tab_hidden(is_hidden, tab_switch_count)
     if not is_hidden:
         monitor.update_activity()
-    window_minimized = False
-
-    if is_hidden:
-        window_minimized = minimize_active_browser_window()
 
     return jsonify(
         {
             "success": True,
             "tab_hidden": is_hidden,
             "tab_switch_count": tab_switch_count,
-            "window_minimized": window_minimized,
         }
     )
 

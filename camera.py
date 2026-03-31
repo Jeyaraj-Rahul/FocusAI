@@ -1,47 +1,70 @@
+import platform
 import threading
 import time
 from collections import deque
-import platform
 
 import cv2
+import mediapipe as mp
 
 
 class FocusMonitor:
-    """Track user focus using simple rule-based signals."""
+    """Track focus using MediaPipe face mesh, gaze direction, and eye closure."""
 
     def __init__(self):
-        # Haar cascade is bundled with OpenCV and is good for a beginner-friendly demo.
-        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        self.face_cascade = cv2.CascadeClassifier(cascade_path)
+        # MediaPipe Face Mesh provides stable landmarks for face direction and eyes.
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
 
         self.lock = threading.Lock()
         self.camera = None
         self.current_frame = None
-        # Remember the last time a face was clearly detected.
+
         self.last_face_seen_time = time.time()
-        self.face_missing_started_at = None
         self.last_activity_at = time.time()
+        self.last_look_at_screen_time = time.time()
+        self.looking_away_started_at = None
+        self.eyes_closed_started_at = None
+
         self.tab_hidden = False
         self.tab_switch_count = 0
         self.last_tab_switch_count = 0
         self.recent_tab_switches = deque()
+
         self.state = "Deep Focus"
         self.focus_score = 80
-        self.message = "You are fully focused right now."
-        self.face_detected = False
-        self.last_error = ""
-        self.failed_reads = 0
+        self.current_score = 80.0
+        self.message = "Face detected and focus is steady."
         self.current_issue = "none"
-        self.last_debug_print_at = 0
-        self.current_score = 80
-        self.score_step_up = 1
-        self.score_step_down = 2
-        self.score_update_interval = 0.5
-        self.last_score_update_time = time.time()
+
+        self.face_detected = False
+        self.looking_away = False
+        self.eyes_closed = False
+        self.last_error = ""
+
+        self.failed_reads = 0
         self.last_valid_frame_time = time.time()
         self.camera_fail_threshold_seconds = 3
+
+        # Recover slowly, but drop faster when distraction signals are present.
+        self.score_step_up = 0.6
+        self.score_step_down = 3.0
+        self.score_update_interval = 0.5
+        self.last_score_update_time = time.time()
+        self.look_away_threshold_seconds = 4
+        self.eyes_closed_threshold_seconds = 3
+        self.look_away_penalty = 1.5
+        self.eyes_closed_penalty = 3.0
+        self.tab_switch_penalty = 1.0
+
         self.loop_iteration = 0
         self.last_loop_log_at = 0
+        self.last_debug_print_at = 0
 
         # Session tracking stays in memory for the current app run only.
         self.session_started_at = time.time()
@@ -59,22 +82,15 @@ class FocusMonitor:
             "idle": 0,
         }
 
-        # Open the webcam once during startup using a Windows-friendly backend.
         self.camera = self._open_camera()
-
-        # Start the detection loop in the background.
         self.worker = threading.Thread(target=self._update_loop, daemon=True)
         self.worker.start()
 
     def _open_camera(self):
         """Open the webcam with backend fallback for better Windows compatibility."""
-        backends = []
-
+        backends = [cv2.CAP_ANY]
         if platform.system() == "Windows":
-            # DirectShow is often more reliable than MSMF for webcams on Windows.
             backends = [cv2.CAP_DSHOW, cv2.CAP_ANY]
-        else:
-            backends = [cv2.CAP_ANY]
 
         for backend in backends:
             camera = cv2.VideoCapture(0, backend)
@@ -96,7 +112,7 @@ class FocusMonitor:
         self.failed_reads = 0
 
     def _update_loop(self):
-        """Continuously read webcam frames and update focus state."""
+        """Continuously read webcam frames and update focus signals in the background."""
         while True:
             try:
                 now = time.time()
@@ -119,21 +135,14 @@ class FocusMonitor:
                 if not success:
                     self.failed_reads += 1
                     seconds_since_valid_frame = time.time() - self.last_valid_frame_time
-
                     print("Camera fail count:", self.failed_reads)
 
                     with self.lock:
-                        # Ignore short camera glitches and keep the last known state.
                         if seconds_since_valid_frame < self.camera_fail_threshold_seconds:
-                            self.last_error = (
-                                "Temporary camera read issue. Keeping last known state."
-                            )
+                            self.last_error = "Temporary camera read issue. Keeping last known state."
                         else:
-                            self.last_error = (
-                                "Camera has failed for several seconds. Trying to reconnect."
-                            )
+                            self.last_error = "Camera has failed for several seconds. Trying to reconnect."
 
-                    # Only restart the camera after repeated failures over time.
                     if (
                         self.failed_reads >= 5
                         and seconds_since_valid_frame >= self.camera_fail_threshold_seconds
@@ -145,117 +154,202 @@ class FocusMonitor:
                 self.failed_reads = 0
                 self.last_valid_frame_time = time.time()
 
-                processed_frame, face_detected = self._detect_face(frame)
-                self._update_focus_state(face_detected)
+                processed_frame, detection = self._detect_face_and_eyes(frame)
+                self._update_focus_state(detection)
 
                 with self.lock:
                     self.current_frame = processed_frame
-                    self.face_detected = face_detected
+                    self.face_detected = detection["face_detected"]
+                    self.looking_away = detection["looking_away"]
+                    self.eyes_closed = detection["eyes_closed"]
                     self.last_error = ""
 
                 time.sleep(0.03)
             except Exception as error:
-                # Keep the worker alive even if OpenCV throws unexpectedly.
                 with self.lock:
                     self.last_error = f"Camera loop error: {error}"
                 print(f"[FocusAI Camera Loop Error] {error}")
                 self._restart_camera()
                 time.sleep(0.5)
 
-    def _detect_face(self, frame):
-        """Find faces in the current frame and draw a box around them."""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    def _to_pixel(self, landmark, width, height):
+        """Convert a normalized MediaPipe landmark into image coordinates."""
+        return int(landmark.x * width), int(landmark.y * height)
 
-        # Improve contrast slightly so the Haar cascade works better on
-        # dim or uneven webcam lighting.
-        gray = cv2.equalizeHist(gray)
+    def _distance(self, point_a, point_b):
+        """Return Euclidean distance between two 2D points."""
+        return ((point_a[0] - point_b[0]) ** 2 + (point_a[1] - point_b[1]) ** 2) ** 0.5
 
-        # Run detection on a smaller image to improve speed and stability.
-        small_gray = cv2.resize(gray, (0, 0), fx=0.75, fy=0.75)
+    def _calculate_eye_aspect_ratio(self, landmarks, eye_points, width, height):
+        """Compute a simple eye aspect ratio to estimate whether the eye is closed."""
+        left_corner = self._to_pixel(landmarks[eye_points[0]], width, height)
+        right_corner = self._to_pixel(landmarks[eye_points[1]], width, height)
+        top_upper = self._to_pixel(landmarks[eye_points[2]], width, height)
+        top_lower = self._to_pixel(landmarks[eye_points[3]], width, height)
+        bottom_upper = self._to_pixel(landmarks[eye_points[4]], width, height)
+        bottom_lower = self._to_pixel(landmarks[eye_points[5]], width, height)
 
-        faces = self.face_cascade.detectMultiScale(
-            small_gray,
-            scaleFactor=1.1,
-            minNeighbors=4,
-            minSize=(60, 60),
-        )
+        vertical_1 = self._distance(top_upper, bottom_upper)
+        vertical_2 = self._distance(top_lower, bottom_lower)
+        horizontal = max(1.0, self._distance(left_corner, right_corner))
+        return (vertical_1 + vertical_2) / (2.0 * horizontal)
 
-        scaled_faces = []
-        for (x, y, w, h) in faces:
-            scaled_faces.append(
-                (
-                    int(x / 0.75),
-                    int(y / 0.75),
-                    int(w / 0.75),
-                    int(h / 0.75),
-                )
-            )
+    def _detect_face_and_eyes(self, frame):
+        """Detect the face, estimate gaze direction, and detect closed eyes."""
+        height, width = frame.shape[:2]
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(rgb_frame)
 
-        # If multiple faces are found, use the largest one as the main user.
-        if scaled_faces:
-            scaled_faces.sort(key=lambda box: box[2] * box[3], reverse=True)
+        detection = {
+            "face_detected": False,
+            "looking_away": False,
+            "eyes_closed": False,
+        }
 
-        face_detected = len(scaled_faces) > 0
-        box_color = (54, 179, 126) if face_detected else (72, 99, 255)
-
-        if face_detected:
-            x, y, w, h = scaled_faces[0]
-            cv2.rectangle(frame, (x, y), (x + w, y + h), box_color, 2)
-            cv2.putText(
-                frame,
-                "Face detected",
-                (x, max(y - 10, 30)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                box_color,
-                2,
-            )
-        else:
+        if not results.multi_face_landmarks:
             cv2.putText(
                 frame,
                 "No face detected",
                 (20, 40),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,
-                box_color,
+                (72, 99, 255),
+                2,
+            )
+            return frame, detection
+
+        face_landmarks = results.multi_face_landmarks[0].landmark
+        detection["face_detected"] = True
+
+        xs = [landmark.x for landmark in face_landmarks]
+        ys = [landmark.y for landmark in face_landmarks]
+        x1 = max(0, int(min(xs) * width))
+        y1 = max(0, int(min(ys) * height))
+        x2 = min(width, int(max(xs) * width))
+        y2 = min(height, int(max(ys) * height))
+
+        # Use nose position inside the face width as a simple "looking away" estimate.
+        left_face = face_landmarks[234]
+        right_face = face_landmarks[454]
+        nose_tip = face_landmarks[1]
+        face_width = max(0.001, right_face.x - left_face.x)
+        horizontal_ratio = (nose_tip.x - left_face.x) / face_width
+        # Use a wider center zone so normal head movement is still treated as on-screen.
+        detection["looking_away"] = horizontal_ratio < 0.25 or horizontal_ratio > 0.75
+
+        left_eye_points = [33, 133, 160, 158, 153, 144]
+        right_eye_points = [362, 263, 387, 385, 380, 373]
+        left_ear = self._calculate_eye_aspect_ratio(face_landmarks, left_eye_points, width, height)
+        right_ear = self._calculate_eye_aspect_ratio(face_landmarks, right_eye_points, width, height)
+        average_ear = (left_ear + right_ear) / 2.0
+        detection["eyes_closed"] = average_ear < 0.20
+
+        box_color = (54, 179, 126)
+        if detection["looking_away"]:
+            box_color = (0, 215, 255)
+        if detection["eyes_closed"]:
+            box_color = (72, 99, 255)
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+        cv2.putText(
+            frame,
+            "Face detected",
+            (x1, max(y1 - 10, 30)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            box_color,
+            2,
+        )
+
+        if detection["looking_away"]:
+            cv2.putText(
+                frame,
+                "Looking away",
+                (20, 70),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                (0, 215, 255),
                 2,
             )
 
-        return frame, face_detected
+        if detection["eyes_closed"]:
+            cv2.putText(
+                frame,
+                "Eyes closed",
+                (20, 100),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                (72, 99, 255),
+                2,
+            )
 
-    def _update_focus_state(self, face_detected):
-        """Use a continuous score that moves every cycle."""
+        return frame, detection
+
+    def _update_focus_state(self, detection):
+        """Use MediaPipe face mesh signals to determine focus or distraction."""
         now = time.time()
-
         with self.lock:
             recent_switch_count = self._get_recent_switch_count(now)
 
+        face_detected = detection["face_detected"]
+        looking_away = detection["looking_away"]
+        eyes_closed = detection["eyes_closed"]
+
         if face_detected:
             self.last_face_seen_time = now
+
+        # Track how long the user has been looking away.
+        if face_detected and not looking_away:
+            self.last_look_at_screen_time = now
+            self.looking_away_started_at = None
+        elif face_detected and self.looking_away_started_at is None:
+            self.looking_away_started_at = now
+
+        looking_away_seconds = max(0, now - self.last_look_at_screen_time)
+        looking_away_too_long = looking_away_seconds > self.look_away_threshold_seconds
+
+        # Track how long the eyes have stayed closed.
+        if eyes_closed:
+            if self.eyes_closed_started_at is None:
+                self.eyes_closed_started_at = now
+        else:
+            self.eyes_closed_started_at = None
+
+        eyes_closed_seconds = 0
+        if self.eyes_closed_started_at is not None:
+            eyes_closed_seconds = now - self.eyes_closed_started_at
+        eyes_closed_too_long = eyes_closed_seconds > self.eyes_closed_threshold_seconds
 
         face_missing_seconds = max(0, now - self.last_face_seen_time)
         previous_state = self.state
         previous_score = self.current_score
 
-        # Update the score on a fixed time interval instead of every camera frame.
-        # This keeps the behavior stable even if OpenCV reads frames very quickly.
+        # Update the score on a fixed interval so the changes stay smooth.
         if now - self.last_score_update_time >= self.score_update_interval:
-            if face_detected:
-                self.current_score += self.score_step_up
+            if face_detected and not looking_away_too_long and not eyes_closed_too_long:
+                # Recover more slowly near the top so the score does not stay pinned at 100.
+                if self.current_score < 70:
+                    self.current_score += self.score_step_up
+                elif self.current_score < 90:
+                    self.current_score += self.score_step_up * 0.7
+                else:
+                    self.current_score += self.score_step_up * 0.25
             else:
                 self.current_score -= self.score_step_down
 
-            # Small penalty for repeated tab switching.
             if recent_switch_count > 0:
-                self.current_score -= min(1, recent_switch_count // 3)
+                self.current_score -= min(self.tab_switch_penalty, recent_switch_count * 0.25)
+
+            if looking_away_too_long:
+                self.current_score -= self.look_away_penalty
+            if eyes_closed_too_long:
+                self.current_score -= self.eyes_closed_penalty
 
             self.last_score_update_time = now
 
-        # Keep the score inside 0-100.
-        self.current_score = max(0, min(100, self.current_score))
-        self.focus_score = self.current_score
+        self.current_score = max(0.0, min(100.0, self.current_score))
+        self.focus_score = int(round(self.current_score))
 
-        # Derive the state from the score.
         if self.current_score >= 80:
             next_state = "Deep Focus"
             next_message = "Face detected and focus is steady."
@@ -266,8 +360,15 @@ class FocusMonitor:
             next_issue = "tab switching" if recent_switch_count > 0 else "none"
         else:
             next_state = "High Distraction"
-            next_message = "Focus is low right now. Please return your attention."
-            next_issue = "no face"
+            if not face_detected:
+                next_message = "Face not detected. Please return to the frame."
+                next_issue = "no face"
+            elif eyes_closed_too_long:
+                next_message = "Eyes closed for too long. You may be drowsy."
+                next_issue = "idle"
+            else:
+                next_message = "Looking away from the screen too often."
+                next_issue = "idle"
 
         self._record_state_time(now)
         self.state = next_state
@@ -286,10 +387,13 @@ class FocusMonitor:
                 "[FocusAI Debug]",
                 f"score={self.focus_score}",
                 f"face_detected={face_detected}",
+                f"looking_away={looking_away}",
+                f"eyes_closed={eyes_closed}",
                 f"previous_score={previous_score}",
                 f"tab_switch_count={recent_switch_count}",
                 f"state={self.state}",
-                f"seconds_without_face={face_missing_seconds:.1f}",
+                f"looking_away_seconds={looking_away_seconds:.1f}",
+                f"eyes_closed_seconds={eyes_closed_seconds:.1f}",
             )
             self.last_debug_print_at = now
 
@@ -338,9 +442,7 @@ class FocusMonitor:
     def get_session_summary(self):
         """Return a simple in-memory session summary."""
         now = time.time()
-
         with self.lock:
-            # Include the currently active state up to the moment this summary is requested.
             state_totals = self.time_in_states.copy()
             if self.state in state_totals:
                 state_totals[self.state] += max(0, now - self.last_state_changed_at)
@@ -370,32 +472,84 @@ class FocusMonitor:
 
     def get_face_detected_status(self):
         """Return the simple backend payload for the dashboard."""
+        return self.get_face_detected_status_with_site()
+
+    def _build_status_payload(self, site_name=None, site_category="Neutral"):
+        """Build the public status payload, including website-based score penalties."""
         with self.lock:
-            return {
-                "state": self.state,
-                "score": self.focus_score,
-                "message": self.message,
-            }
+            score = self.focus_score
+            base_message = self.message
+            looking_away = self.looking_away
+            eyes_closed = self.eyes_closed
+
+        if site_category == "Distracting":
+            score = max(0, score - 30)
+        elif site_category == "Productive":
+            score = min(100, score + 2)
+
+        if score >= 80:
+            state = "Deep Focus"
+        elif score >= 50:
+            state = "Mild Distraction"
+        else:
+            state = "High Distraction"
+
+        if eyes_closed:
+            message = "Eyes appear closed. Stay alert."
+        elif looking_away:
+            message = "Looking away from the screen."
+        elif site_category == "Distracting" and site_name:
+            message = f"Distracting site detected: {site_name}. Focus score reduced."
+        elif site_category == "Productive" and site_name:
+            message = f"Productive site detected: {site_name}. Keep going."
+        else:
+            message = base_message
+
+        return {
+            "state": state,
+            "score": score,
+            "message": message,
+            "active_site": site_name,
+            "active_site_category": site_category,
+        }
+
+    def get_face_detected_status_with_site(self, site_name=None, site_category="Neutral"):
+        """Return the lightweight status payload used by the dashboard."""
+        return self._build_status_payload(site_name, site_category)
 
     def get_status(self):
+        """Return a serializable snapshot for the frontend."""
+        return self.get_status_with_site()
+
+    def get_status_with_site(self, site_name=None, site_category="Neutral"):
         """Return a serializable snapshot for the frontend."""
         now = time.time()
         with self.lock:
             face_missing_seconds = max(0, now - self.last_face_seen_time)
             idle_seconds = max(0, now - self.last_activity_at)
             recent_switch_count = self._get_recent_switch_count(now)
-            return {
-                "state": self.state,
-                "score": self.focus_score,
-                "message": self.message,
-                "face_detected": self.face_detected,
-                "tab_hidden": self.tab_hidden,
-                "tab_switch_count": self.tab_switch_count,
-                "recent_tab_switch_count": recent_switch_count,
-                "seconds_without_face": round(face_missing_seconds, 1),
-                "idle_seconds": round(idle_seconds, 1),
-                "last_error": self.last_error,
-            }
+            looking_away_seconds = max(0, now - self.last_look_at_screen_time)
+            eyes_closed_seconds = 0
+            if self.eyes_closed_started_at is not None:
+                eyes_closed_seconds = now - self.eyes_closed_started_at
+
+            payload = self._build_status_payload(site_name, site_category)
+            payload.update(
+                {
+                    "face_detected": self.face_detected,
+                    "looking_away": self.looking_away,
+                    "eyes_closed": self.eyes_closed,
+                    "tab_hidden": self.tab_hidden,
+                    "tab_switch_count": self.tab_switch_count,
+                    "recent_tab_switch_count": recent_switch_count,
+                    "seconds_without_face": round(face_missing_seconds, 1),
+                    "idle_seconds": round(idle_seconds, 1),
+                    "looking_away_seconds": round(looking_away_seconds, 1),
+                    "eyes_closed_seconds": round(eyes_closed_seconds, 1),
+                    "last_error": self.last_error,
+                }
+            )
+            return payload
 
     def generate_frames(self):
         """Yield JPEG frames continuously for Flask streaming."""
@@ -423,6 +577,8 @@ class FocusMonitor:
                 time.sleep(0.2)
 
     def __del__(self):
-        """Release the webcam when the app shuts down."""
+        """Release resources when the app shuts down."""
         if hasattr(self, "camera") and self.camera is not None and self.camera.isOpened():
             self.camera.release()
+        if hasattr(self, "face_mesh") and self.face_mesh is not None:
+            self.face_mesh.close()

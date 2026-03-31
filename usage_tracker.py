@@ -182,3 +182,20 @@ class WebsiteUsageTracker:
                 "time_spent": snapshot_time_spent,
                 "category": category,
             }
+
+    def get_current_site_info(self):
+        """Return the current active site and its category."""
+        with self.lock:
+            if not self.current_site:
+                return {
+                    "site": None,
+                    "category": "Neutral",
+                }
+
+            return {
+                "site": self.current_site,
+                "category": self.category.get(
+                    self.current_site,
+                    self._classify_site(self.current_site),
+                ),
+            }

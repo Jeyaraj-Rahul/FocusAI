@@ -6,22 +6,41 @@ from collections import deque
 import cv2
 import mediapipe as mp
 
+try:
+    # Most MediaPipe builds expose Face Mesh from the top-level `solutions` package.
+    MP_FACE_MESH = mp.solutions.face_mesh
+except AttributeError:
+    try:
+        # Some installs expose the same module only from `mediapipe.python.solutions`.
+        from mediapipe.python.solutions import face_mesh as MP_FACE_MESH
+    except Exception:
+        MP_FACE_MESH = None
+
 
 class FocusMonitor:
     """Track focus using MediaPipe face mesh, gaze direction, and eye closure."""
 
     def __init__(self):
-        # MediaPipe Face Mesh provides stable landmarks for face direction and eyes.
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            static_image_mode=False,
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
+        # Prefer MediaPipe for richer tracking, but fall back to OpenCV face
+        # detection so the app can still run if Face Mesh is unavailable.
+        self.mp_face_mesh = MP_FACE_MESH
+        self.using_mediapipe = self.mp_face_mesh is not None
+        self.face_mesh = None
+        self.face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
 
-        self.lock = threading.Lock()
+        if self.using_mediapipe:
+            self.face_mesh = self.mp_face_mesh.FaceMesh(
+                static_image_mode=False,
+                max_num_faces=1,
+                refine_landmarks=True,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+
+        # Re-entrant lock avoids deadlocks when status helpers call each other.
+        self.lock = threading.RLock()
         self.camera = None
         self.current_frame = None
 
@@ -46,6 +65,7 @@ class FocusMonitor:
         self.looking_away = False
         self.eyes_closed = False
         self.last_error = ""
+        self.startup_warning = ""
 
         self.failed_reads = 0
         self.last_valid_frame_time = time.time()
@@ -60,7 +80,7 @@ class FocusMonitor:
         self.eyes_closed_threshold_seconds = 3
         self.look_away_penalty = 1.5
         self.eyes_closed_penalty = 3.0
-        self.tab_switch_penalty = 1.0
+        self.tab_switch_penalty = 0.6
 
         self.loop_iteration = 0
         self.last_loop_log_at = 0
@@ -81,6 +101,12 @@ class FocusMonitor:
             "no face": 0,
             "idle": 0,
         }
+
+        if not self.using_mediapipe:
+            self.startup_warning = (
+                "MediaPipe Face Mesh is unavailable. Using basic OpenCV face detection."
+            )
+            self.last_error = self.startup_warning
 
         self.camera = self._open_camera()
         self.worker = threading.Thread(target=self._update_loop, daemon=True)
@@ -162,7 +188,7 @@ class FocusMonitor:
                     self.face_detected = detection["face_detected"]
                     self.looking_away = detection["looking_away"]
                     self.eyes_closed = detection["eyes_closed"]
-                    self.last_error = ""
+                    self.last_error = self.startup_warning
 
                 time.sleep(0.03)
             except Exception as error:
@@ -196,6 +222,9 @@ class FocusMonitor:
 
     def _detect_face_and_eyes(self, frame):
         """Detect the face, estimate gaze direction, and detect closed eyes."""
+        if not self.using_mediapipe or self.face_mesh is None:
+            return self._detect_face_with_opencv(frame)
+
         height, width = frame.shape[:2]
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.face_mesh.process(rgb_frame)
@@ -285,6 +314,49 @@ class FocusMonitor:
 
         return frame, detection
 
+    def _detect_face_with_opencv(self, frame):
+        """Fallback face detector used when MediaPipe is unavailable."""
+        detection = {
+            "face_detected": False,
+            "looking_away": False,
+            "eyes_closed": False,
+        }
+
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.face_cascade.detectMultiScale(
+            gray_frame,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(80, 80),
+        )
+
+        if len(faces) == 0:
+            cv2.putText(
+                frame,
+                "No face detected (OpenCV fallback)",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (72, 99, 255),
+                2,
+            )
+            return frame, detection
+
+        x, y, w, h = max(faces, key=lambda item: item[2] * item[3])
+        detection["face_detected"] = True
+
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (54, 179, 126), 2)
+        cv2.putText(
+            frame,
+            "Face detected (OpenCV fallback)",
+            (x, max(y - 10, 30)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (54, 179, 126),
+            2,
+        )
+        return frame, detection
+
     def _update_focus_state(self, detection):
         """Use MediaPipe face mesh signals to determine focus or distraction."""
         now = time.time()
@@ -292,8 +364,8 @@ class FocusMonitor:
             recent_switch_count = self._get_recent_switch_count(now)
 
         face_detected = detection["face_detected"]
-        looking_away = detection["looking_away"]
-        eyes_closed = detection["eyes_closed"]
+        looking_away = detection["looking_away"] if self.using_mediapipe else False
+        eyes_closed = detection["eyes_closed"] if self.using_mediapipe else False
 
         if face_detected:
             self.last_face_seen_time = now
@@ -306,7 +378,10 @@ class FocusMonitor:
             self.looking_away_started_at = now
 
         looking_away_seconds = max(0, now - self.last_look_at_screen_time)
-        looking_away_too_long = looking_away_seconds > self.look_away_threshold_seconds
+        looking_away_too_long = (
+            self.using_mediapipe
+            and looking_away_seconds > self.look_away_threshold_seconds
+        )
 
         # Track how long the eyes have stayed closed.
         if eyes_closed:
@@ -318,7 +393,10 @@ class FocusMonitor:
         eyes_closed_seconds = 0
         if self.eyes_closed_started_at is not None:
             eyes_closed_seconds = now - self.eyes_closed_started_at
-        eyes_closed_too_long = eyes_closed_seconds > self.eyes_closed_threshold_seconds
+        eyes_closed_too_long = (
+            self.using_mediapipe
+            and eyes_closed_seconds > self.eyes_closed_threshold_seconds
+        )
 
         face_missing_seconds = max(0, now - self.last_face_seen_time)
         previous_state = self.state
@@ -337,8 +415,13 @@ class FocusMonitor:
             else:
                 self.current_score -= self.score_step_down
 
-            if recent_switch_count > 0:
-                self.current_score -= min(self.tab_switch_penalty, recent_switch_count * 0.25)
+            if self.tab_hidden:
+                # Actively being away from the page should hurt more than old switch history.
+                self.current_score -= self.tab_switch_penalty
+            elif recent_switch_count >= 6:
+                self.current_score -= self.tab_switch_penalty * 0.5
+            elif recent_switch_count >= 3:
+                self.current_score -= self.tab_switch_penalty * 0.2
 
             if looking_away_too_long:
                 self.current_score -= self.look_away_penalty
@@ -366,6 +449,9 @@ class FocusMonitor:
             elif eyes_closed_too_long:
                 next_message = "Eyes closed for too long. You may be drowsy."
                 next_issue = "idle"
+            elif not self.using_mediapipe:
+                next_message = "Focus score is low. Stay on the task and remain visible."
+                next_issue = "tab switching" if recent_switch_count > 0 else "none"
             else:
                 next_message = "Looking away from the screen too often."
                 next_issue = "idle"
@@ -389,6 +475,7 @@ class FocusMonitor:
                 f"face_detected={face_detected}",
                 f"looking_away={looking_away}",
                 f"eyes_closed={eyes_closed}",
+                f"using_mediapipe={self.using_mediapipe}",
                 f"previous_score={previous_score}",
                 f"tab_switch_count={recent_switch_count}",
                 f"state={self.state}",
@@ -494,9 +581,9 @@ class FocusMonitor:
         else:
             state = "High Distraction"
 
-        if eyes_closed:
+        if self.using_mediapipe and eyes_closed:
             message = "Eyes appear closed. Stay alert."
-        elif looking_away:
+        elif self.using_mediapipe and looking_away:
             message = "Looking away from the screen."
         elif site_category == "Distracting" and site_name:
             message = f"Distracting site detected: {site_name}. Focus score reduced."

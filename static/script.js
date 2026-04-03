@@ -351,8 +351,12 @@ function setupCameraPreview() {
 }
 
 document.addEventListener("visibilitychange", () => {
-  tabSwitchCount += 1;
-  console.log(`Tab visibility changed. Total switches: ${tabSwitchCount}`);
+  if (document.hidden) {
+    tabSwitchCount += 1;
+  }
+  console.log(
+    `Tab visibility changed. Hidden: ${document.hidden}. Total switches: ${tabSwitchCount}`
+  );
   sendTabActivity();
 });
 

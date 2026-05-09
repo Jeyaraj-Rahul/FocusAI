@@ -1,0 +1,44 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: docugen-ai-postgres
+    environment:
+      POSTGRES_USER: docugen
+      POSTGRES_PASSWORD: docugen
+      POSTGRES_DB: docugen_ai
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ./backend
+    container_name: docugen-ai-backend
+    env_file:
+      - ./backend/.env.example
+    environment:
+      DATABASE_URL: postgresql+psycopg://docugen:docugen@postgres:5432/docugen_ai
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+    volumes:
+      - ./backend/app:/app/app
+      - ./backend/storage:/app/storage
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: docugen-ai-frontend
+    env_file:
+      - ./frontend/.env.example
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend/src:/app/src
+
+volumes:
+  postgres-data:

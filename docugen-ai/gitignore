@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+env/
+
+# Environment
+.env
+
+# Node
+node_modules/
+
+# Vite
+dist/
+
+# Storage
+backend/storage/generated/
+backend/storage/uploads/
+
+# Docker
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
